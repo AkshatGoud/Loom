@@ -4,20 +4,24 @@ import { ChatView } from './components/ChatView';
 import { SettingsModal } from './components/SettingsModal';
 import { OllamaOnboarding } from './components/OllamaOnboarding';
 import { ModelLibrary } from './components/ModelLibrary';
+import { ServerList } from './components/mcp/ServerList';
 import { useConversations } from './stores/conversations';
 import { useSettings } from './stores/settings';
 import { useOllama } from './stores/ollama';
 import { useModels } from './stores/models';
+import { useMcp } from './stores/mcp';
 import { useStreamingChat } from './hooks/useStreamingChat';
 
 export function App() {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [libraryOpen, setLibraryOpen] = useState(false);
+  const [serversOpen, setServersOpen] = useState(false);
   const [onboardingDismissed, setOnboardingDismissed] = useState(false);
   const refreshConversations = useConversations((s) => s.refresh);
   const refreshSettings = useSettings((s) => s.refresh);
   const initOllama = useOllama((s) => s.init);
   const initModels = useModels((s) => s.init);
+  const initMcp = useMcp((s) => s.init);
   const ollamaStatus = useOllama((s) => s.status);
   const conversations = useConversations((s) => s.conversations);
   const activeId = useConversations((s) => s.activeId);
@@ -25,13 +29,18 @@ export function App() {
 
   const { streamingMessageId } = useStreamingChat();
 
-  // Initial load: settings, ollama daemon, installed models, conversations.
+  // Initial load: settings, ollama daemon, installed models, MCP servers, conversations.
   useEffect(() => {
     void (async () => {
-      await Promise.all([refreshSettings(), initOllama(), initModels()]);
+      await Promise.all([
+        refreshSettings(),
+        initOllama(),
+        initModels(),
+        initMcp()
+      ]);
       await refreshConversations();
     })();
-  }, [refreshConversations, refreshSettings, initOllama, initModels]);
+  }, [refreshConversations, refreshSettings, initOllama, initModels, initMcp]);
 
   // Auto-select the first conversation on load or when the active one
   // goes away.
@@ -53,16 +62,19 @@ export function App() {
       <Sidebar
         onOpenSettings={() => setSettingsOpen(true)}
         onOpenLibrary={() => setLibraryOpen(true)}
+        onOpenServers={() => setServersOpen(true)}
       />
       <ChatView
         streamingMessageId={streamingMessageId}
         onOpenLibrary={() => setLibraryOpen(true)}
+        onOpenServers={() => setServersOpen(true)}
       />
       <SettingsModal open={settingsOpen} onClose={() => setSettingsOpen(false)} />
       <ModelLibrary
         open={libraryOpen}
         onClose={() => setLibraryOpen(false)}
       />
+      <ServerList open={serversOpen} onClose={() => setServersOpen(false)} />
       {needsOnboarding && (
         <OllamaOnboarding onDismiss={() => setOnboardingDismissed(true)} />
       )}

@@ -26,6 +26,7 @@ import {
   applyImmediateAutoRename,
   refineTitleWithLLM
 } from '../chat/auto-rename';
+import { registerMcpIpcHandlers } from './mcp';
 import type {
   ChatSendInput,
   ChatStatusInfo,
@@ -125,6 +126,9 @@ export function registerIpcHandlers(): void {
   ipcMain.handle('models:cancelPull', (_e, name: string) => cancelPull(name));
   ipcMain.handle('models:delete', (_e, name: string) => deleteModel(name));
   ipcMain.handle('models:show', (_e, name: string) => showModel(name));
+
+  // ----- MCP server management + approvals (Phase 7) -----
+  registerMcpIpcHandlers();
 
   // ----- Conversations -----
   ipcMain.handle('conversations:list', (): Conversation[] => conversationsDb.list());
@@ -230,12 +234,13 @@ export function registerIpcHandlers(): void {
       ...buildHistory(conversation.id)
     ];
 
-    // 3. Resolve the active MCP tool catalog. Phase 6 exposes EVERY
-    //    registered MCP server to EVERY chat — per-conversation
-    //    attachment comes in Phase 7 (sub-section c).
+    // 3. Resolve the active MCP tool catalog for this specific
+    //    conversation. Phase 7 gates tool visibility by the
+    //    conversation_servers join table — only explicitly-attached
+    //    servers feed into the provider tools[] request.
     const provider = getProvider(conversation.provider);
     const activeTools = provider.supportsTools
-      ? await collectActiveTools()
+      ? await collectActiveTools(conversation.id)
       : { tools: [], routes: new Map() };
 
     const controller = new AbortController();
@@ -417,7 +422,12 @@ export function registerIpcHandlers(): void {
 
           const { resultText, isError, durationMs } = await routeToolCall(
             activeTools.routes,
-            { id: call.id, name: call.name, arguments: call.arguments }
+            { id: call.id, name: call.name, arguments: call.arguments },
+            {
+              conversationId: conversation.id,
+              messageId: assistantMsg.id,
+              signal: controller.signal
+            }
           );
 
           const toolMsg = messagesDb.insert({

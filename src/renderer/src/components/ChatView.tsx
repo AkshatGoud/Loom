@@ -4,6 +4,8 @@ import { Composer } from './Composer';
 import { Message } from './Message';
 import { ModelPicker } from './ModelPicker';
 import { StatusPill } from './StatusPill';
+import { ConversationTools } from './mcp/ConversationTools';
+import { ToolApprovalDialog } from './mcp/ToolApprovalDialog';
 import {
   useActiveConversation,
   useActiveMessages,
@@ -11,15 +13,19 @@ import {
 } from '../stores/conversations';
 import { useSettings } from '../stores/settings';
 import { useOllama } from '../stores/ollama';
+import { usePendingApprovalsForMessage } from '../stores/mcp';
 
 interface ChatViewProps {
   streamingMessageId: string | null;
   onOpenLibrary: () => void;
+  /** Opens the MCP Server Library modal. */
+  onOpenServers: () => void;
 }
 
 export function ChatView({
   streamingMessageId,
-  onOpenLibrary
+  onOpenLibrary,
+  onOpenServers
 }: ChatViewProps) {
   const conversation = useActiveConversation();
   const messages = useActiveMessages();
@@ -34,6 +40,9 @@ export function ChatView({
   const activeStatus = useConversations((s) =>
     streamingMessageId ? (s.messageStatus[streamingMessageId] ?? null) : null
   );
+  // Pending tool-call approval requests targeted at the current
+  // streaming message. Phase 7: rendered inline in the chat stream.
+  const pendingApprovals = usePendingApprovalsForMessage(streamingMessageId);
   const scrollRef = useRef<HTMLDivElement>(null);
   const [unloading, setUnloading] = useState(false);
   const [switchToast, setSwitchToast] = useState<{
@@ -135,6 +144,7 @@ export function ChatView({
   return (
     <div className="flex h-full min-w-0 flex-1 flex-col">
       <ChatHeader
+        conversationId={conversation.id}
         title={conversation.title}
         provider={conversation.provider}
         modelId={conversation.modelId}
@@ -155,6 +165,7 @@ export function ChatView({
         onSwitchModel={handleModelSwitch}
         onSwitchModelAndUnload={handleModelSwitchAndUnload}
         onOpenLibrary={onOpenLibrary}
+        onOpenServers={onOpenServers}
       />
 
       <div ref={scrollRef} className="flex-1 overflow-y-auto">
@@ -174,6 +185,10 @@ export function ChatView({
           ))
         )}
       </div>
+
+      {pendingApprovals.map((req) => (
+        <ToolApprovalDialog key={req.id} request={req} />
+      ))}
 
       {activeStatus && (
         <div className="flex">
@@ -217,6 +232,7 @@ export function ChatView({
 // ----- Header subcomponent -----
 
 interface ChatHeaderProps {
+  conversationId: string;
   title: string;
   provider: string;
   modelId: string;
@@ -228,9 +244,11 @@ interface ChatHeaderProps {
   onSwitchModel: (modelId: string) => void;
   onSwitchModelAndUnload: (modelId: string) => void;
   onOpenLibrary: () => void;
+  onOpenServers: () => void;
 }
 
 function ChatHeader({
+  conversationId,
   title,
   provider,
   modelId,
@@ -241,7 +259,8 @@ function ChatHeader({
   onUnload,
   onSwitchModel,
   onSwitchModelAndUnload,
-  onOpenLibrary
+  onOpenLibrary,
+  onOpenServers
 }: ChatHeaderProps) {
   return (
     <header
@@ -269,6 +288,11 @@ function ChatHeader({
           onSelect={onSwitchModel}
           onSelectAndUnload={onSwitchModelAndUnload}
           onOpenLibrary={onOpenLibrary}
+        />
+        <ConversationTools
+          conversationId={conversationId}
+          provider={provider}
+          onOpenLibrary={onOpenServers}
         />
         {isOllama && loadedInRam && (
           <button

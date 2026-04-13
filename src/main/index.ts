@@ -4,6 +4,7 @@ import { dirname, join } from 'node:path';
 import { homedir } from 'node:os';
 import { initDb } from './db';
 import { registerIpcHandlers } from './ipc';
+import { loadPersistedMcpServers } from './ipc/mcp';
 import { registerProvider } from './inference/provider';
 import { openAiProvider } from './inference/openai';
 import { ollamaProvider } from './inference/ollama';
@@ -14,6 +15,7 @@ import {
   callTool as callMcpTool,
   disconnectAll as disconnectAllMcp
 } from './mcp/registry';
+import { rejectAllPending as rejectAllPendingApprovals } from './mcp/approval';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -77,20 +79,22 @@ function createMainWindow(): void {
 }
 
 /**
- * Dev-mode MCP smoke test (Phase 5).
+ * Dev-mode MCP smoke test (Phase 5). Flipped to opt-in in Phase 7 —
+ * set `LOOM_MCP_SMOKE=1` to enable. Phase 7 replaces the smoke test
+ * as the primary way to verify MCP end-to-end (users configure real
+ * servers via the Server Library), but the smoke test still has
+ * value as a boot-time connectivity probe during development.
  *
- * On `npm run dev`, after the rest of the app is up, spawn the
- * @modelcontextprotocol/server-filesystem preset pointed at the user's
- * home directory, list its tools, invoke one of them, and log the
- * results. This is the "test harness" from Phase 5 of the plan — it
- * proves the registry / client-factory / stdio transport / listTools
- * pagination / callTool wiring works end-to-end with zero UI.
+ * The smoke-test server is registered with id `smoke:filesystem` so
+ * it NEVER collides with user-configured servers and is never
+ * auto-attached to any conversation — Phase 7's
+ * `conversation_servers` gating takes care of that.
  *
  * Silent in production builds so packaged users never see these logs.
  */
 async function runMcpSmokeTest(): Promise<void> {
   if (!process.env.ELECTRON_RENDERER_URL) return; // prod build → skip
-  if (process.env.LOOM_SKIP_MCP_SMOKE === '1') return;
+  if (process.env.LOOM_MCP_SMOKE !== '1') return; // opt-in as of Phase 7
 
   const testId = 'smoke:filesystem';
   try {
@@ -147,8 +151,13 @@ app.whenReady().then(() => {
   startHealthWatcher();
   createMainWindow();
 
-  // Kick off the MCP smoke test after the window is visible so it
-  // doesn't delay first paint. Fire-and-forget — failures only log.
+  // Phase 7: reload every MCP server the user has configured into the
+  // live registry. Lazy-connect — the child processes aren't spawned
+  // until the user actually sends a chat that uses an attached server.
+  void loadPersistedMcpServers();
+
+  // Opt-in smoke test (set LOOM_MCP_SMOKE=1). Off by default as of
+  // Phase 7 since users configure real servers via the Server Library.
   void runMcpSmokeTest();
 
   app.on('activate', () => {
@@ -157,6 +166,9 @@ app.whenReady().then(() => {
 });
 
 app.on('before-quit', () => {
+  // Unblock any chat turns that are still awaiting user approval so
+  // the app can quit cleanly.
+  rejectAllPendingApprovals();
   // Cleanly tear down any MCP stdio subprocesses so they don't orphan
   // on SIGTERM. The promise is deliberately not awaited — Electron's
   // before-quit event is synchronous and we can't block it, but we at

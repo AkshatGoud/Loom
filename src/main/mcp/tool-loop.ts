@@ -3,6 +3,8 @@ import {
   listToolsForServer,
   callTool as callMcpTool
 } from './registry';
+import { requestApproval } from './approval';
+import { conversationServersDb } from '../db';
 import type { ProviderTool } from '../inference/provider';
 import type { MCPToolContent } from '../../shared/types';
 
@@ -45,21 +47,32 @@ export interface ActiveTools {
 }
 
 /**
- * Collect every enabled MCP server's tool catalog into a single
- * ProviderTool[] ready to pass to a provider.stream() call.
+ * Collect the MCP tool catalog attached to a specific conversation.
  *
- * Phase 6 surfaces every registered server automatically. Phase 7 will
- * layer per-conversation attachment on top — right now, if a server
- * exists in the registry, its tools are available to every chat.
+ * Phase 6 exposed every registered server to every chat as a
+ * workaround — Phase 7 replaces that with real per-conversation
+ * attachment driven by the `conversation_servers` join table. The
+ * conversationId must be passed; a conversation with no attached
+ * servers gets an empty tool list.
  */
-export async function collectActiveTools(): Promise<ActiveTools> {
+export async function collectActiveTools(
+  conversationId: string
+): Promise<ActiveTools> {
   const tools: ProviderTool[] = [];
   const routes = new Map<string, ToolRouteEntry>();
   const seen = new Set<string>();
 
+  // Load the attachment set once — conversations with zero attached
+  // servers short-circuit and hand back an empty catalog.
+  const attachedIds = new Set(conversationServersDb.list(conversationId));
+  if (attachedIds.size === 0) {
+    return { tools, routes };
+  }
+
   const servers = listServers();
   for (const server of servers) {
     if (!server.config.enabled) continue;
+    if (!attachedIds.has(server.config.id)) continue;
     let serverTools = server.tools;
     // Registry caches tools on connect — lazily populate if needed.
     if (serverTools.length === 0) {
@@ -96,18 +109,27 @@ export async function collectActiveTools(): Promise<ActiveTools> {
   return { tools, routes };
 }
 
+export interface RouteToolCallContext {
+  conversationId: string;
+  messageId: string;
+  signal?: AbortSignal;
+}
+
 /**
  * Resolve a provider-emitted tool call back to the real MCP server and
- * tool name, and invoke it. Returns a plain-text flattening of the
- * result suitable to hand back to the model as a `role: 'tool'`
- * message.
+ * tool name, run it through the approval system, and invoke it.
+ * Returns a plain-text flattening of the result suitable to hand back
+ * to the model as a `role: 'tool'` message.
  *
  * Errors are NOT thrown — they're returned as text so the model can
  * see them in context and recover (e.g. retry with different args).
+ * A user-denied call returns a clean "denied by user" string so the
+ * model can reason about it rather than crashing the turn.
  */
 export async function routeToolCall(
   routes: Map<string, ToolRouteEntry>,
-  call: { id: string; name: string; arguments: unknown }
+  call: { id: string; name: string; arguments: unknown },
+  ctx: RouteToolCallContext
 ): Promise<{ serverId: string; resultText: string; isError: boolean; durationMs: number | undefined }> {
   const route = routes.get(call.name);
   if (!route) {
@@ -123,6 +145,38 @@ export async function routeToolCall(
     call.arguments && typeof call.arguments === 'object'
       ? (call.arguments as Record<string, unknown>)
       : {};
+
+  // Gate the call through the approval subsystem. For conversations
+  // with no stored policy and no global auto-approve flag, this
+  // blocks on the user clicking one of the three buttons in the
+  // inline approval card.
+  let outcome;
+  try {
+    outcome = await requestApproval({
+      conversationId: ctx.conversationId,
+      messageId: ctx.messageId,
+      serverId: route.serverId,
+      toolName: route.toolName,
+      args,
+      signal: ctx.signal
+    });
+  } catch (err) {
+    return {
+      serverId: route.serverId,
+      resultText: `Approval interrupted: ${err instanceof Error ? err.message : 'unknown error'}`,
+      isError: true,
+      durationMs: undefined
+    };
+  }
+
+  if (outcome.kind === 'deny') {
+    return {
+      serverId: route.serverId,
+      resultText: `The user denied permission to call ${route.toolName} on ${route.serverId}. Do not retry this specific call; ask the user for clarification or try a different approach.`,
+      isError: true,
+      durationMs: undefined
+    };
+  }
 
   try {
     const result = await callMcpTool(route.serverId, route.toolName, args);

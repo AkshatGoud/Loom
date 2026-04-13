@@ -5,6 +5,10 @@ import type {
   Conversation,
   ConversationCreateInput,
   IpcApi,
+  MCPApprovalDecision,
+  MCPApprovalRequest,
+  MCPServerConfig,
+  MCPServerState,
   ModelPullProgress,
   OllamaStatus,
   ProviderId
@@ -38,6 +42,39 @@ const api: IpcApi = {
       ipcRenderer.on('ollama:pullProgress', listener);
       return () => {
         ipcRenderer.removeListener('ollama:pullProgress', listener);
+      };
+    }
+  },
+  mcp: {
+    listServers: () => ipcRenderer.invoke('mcp:listServers'),
+    listPresets: () => ipcRenderer.invoke('mcp:listPresets'),
+    saveServer: (config: MCPServerConfig) =>
+      ipcRenderer.invoke('mcp:saveServer', config),
+    removeServer: (id: string) => ipcRenderer.invoke('mcp:removeServer', id),
+    getAttachments: (conversationId: string) =>
+      ipcRenderer.invoke('mcp:getAttachments', conversationId),
+    setAttachments: (conversationId: string, serverIds: string[]) =>
+      ipcRenderer.invoke('mcp:setAttachments', conversationId, serverIds),
+    resolveApproval: (approvalId: string, decision: MCPApprovalDecision) =>
+      ipcRenderer.invoke('mcp:resolveApproval', approvalId, decision),
+    onServersChanged: (handler) => {
+      const listener = (
+        _e: Electron.IpcRendererEvent,
+        servers: MCPServerState[]
+      ) => handler(servers);
+      ipcRenderer.on('mcp:serversChanged', listener);
+      return () => {
+        ipcRenderer.removeListener('mcp:serversChanged', listener);
+      };
+    },
+    onApprovalRequest: (handler) => {
+      const listener = (
+        _e: Electron.IpcRendererEvent,
+        request: MCPApprovalRequest
+      ) => handler(request);
+      ipcRenderer.on('mcp:approvalRequest', listener);
+      return () => {
+        ipcRenderer.removeListener('mcp:approvalRequest', listener);
       };
     }
   },

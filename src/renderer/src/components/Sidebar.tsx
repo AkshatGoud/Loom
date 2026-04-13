@@ -3,6 +3,7 @@ import {
   MessageSquarePlus,
   Package,
   Search,
+  Server,
   Settings,
   Trash2
 } from 'lucide-react';
@@ -17,9 +18,14 @@ import { cn, formatTimestamp } from '../lib/utils';
 interface SidebarProps {
   onOpenSettings: () => void;
   onOpenLibrary: () => void;
+  onOpenServers: () => void;
 }
 
-export function Sidebar({ onOpenSettings, onOpenLibrary }: SidebarProps) {
+export function Sidebar({
+  onOpenSettings,
+  onOpenLibrary,
+  onOpenServers
+}: SidebarProps) {
   const conversations = useConversations((s) => s.conversations);
   const activeId = useConversations((s) => s.activeId);
   const selectConversation = useConversations((s) => s.selectConversation);
@@ -133,6 +139,13 @@ export function Sidebar({ onOpenSettings, onOpenLibrary }: SidebarProps) {
         >
           <Package className="h-4 w-4" />
           Models
+        </button>
+        <button
+          onClick={onOpenServers}
+          className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-sm text-muted-foreground transition hover:bg-accent hover:text-accent-foreground"
+        >
+          <Server className="h-4 w-4" />
+          MCP Servers
         </button>
         <button
           onClick={onOpenSettings}

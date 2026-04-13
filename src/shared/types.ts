@@ -188,6 +188,47 @@ export interface MCPCallToolResult {
   durationMs?: number;
 }
 
+/** Metadata used by the Server Library UI to render one-click presets. */
+export interface MCPServerPreset {
+  /** Stable id used to dedupe duplicate installs. */
+  id: string;
+  name: string;
+  description: string;
+  family: 'filesystem' | 'memory' | 'github' | 'brave-search' | 'other';
+  legacy?: boolean;
+  /** Extra config fields the Library UI needs to prompt the user for. */
+  requiresPath?: boolean;
+  requiresApiKey?: {
+    envVar: string;
+    label: string;
+  };
+}
+
+/**
+ * A pending tool-call approval request broadcast by the main process
+ * while a chat turn is blocked waiting for user consent.
+ */
+export interface MCPApprovalRequest {
+  id: string;
+  conversationId: string;
+  messageId: string;
+  serverId: string;
+  /** Unnamespaced, user-friendly tool name (e.g. "list_directory"). */
+  toolName: string;
+  /** Parsed JSON arguments, safe to render. */
+  arguments: unknown;
+  createdAt: number;
+}
+
+export type MCPApprovalDecision = 'allow_once' | 'allow_always' | 'deny';
+
+/**
+ * Saved tool approval policy for a (conversation, server, tool) triple.
+ * `never` is reserved for a future "always deny" mode and currently
+ * unused — v1 only writes 'always' rows.
+ */
+export type MCPApprovalPolicy = 'always' | 'never';
+
 export interface ToolCall {
   id: string;
   serverId: string;
@@ -304,6 +345,36 @@ export interface IpcApi {
     show: (name: string) => Promise<ModelShowDetails | null>;
     onPullProgress: (
       handler: (progress: ModelPullProgress) => void
+    ) => () => void;
+  };
+  mcp: {
+    /** List every persisted server and its live connection/tool state. */
+    listServers: () => Promise<MCPServerState[]>;
+    /** Bundled preset catalog shown in the Server Library UI. */
+    listPresets: () => Promise<MCPServerPreset[]>;
+    /** Create or update a server config. */
+    saveServer: (config: MCPServerConfig) => Promise<MCPServerState>;
+    /** Permanently remove a server config and close any live client. */
+    removeServer: (id: string) => Promise<void>;
+    /** Return the list of server ids attached to a conversation. */
+    getAttachments: (conversationId: string) => Promise<string[]>;
+    /** Replace the full set of servers attached to a conversation. */
+    setAttachments: (
+      conversationId: string,
+      serverIds: string[]
+    ) => Promise<void>;
+    /** Resolve a pending approval request. */
+    resolveApproval: (
+      approvalId: string,
+      decision: MCPApprovalDecision
+    ) => Promise<void>;
+    /** Subscribe to registry state changes (connection/tool-catalog updates). */
+    onServersChanged: (
+      handler: (servers: MCPServerState[]) => void
+    ) => () => void;
+    /** Subscribe to incoming approval requests from the tool loop. */
+    onApprovalRequest: (
+      handler: (request: MCPApprovalRequest) => void
     ) => () => void;
   };
   ollama: {

@@ -4,7 +4,7 @@ A professional desktop chat app for local LLMs via Ollama and cloud LLMs via BYO
 
 Loom runs on **macOS** and **Windows**. Local inference uses [Ollama](https://ollama.com) — users install Ollama separately, and Loom detects, connects to, and manages models through it. Cloud providers (OpenAI / Anthropic / Google) are supported via BYOK as optional add-ons.
 
-**Status:** v0.1.0, under active development. Phases 1–6 of the 11-phase build plan are complete and working end-to-end on macOS. Local models can now invoke MCP tools during a chat turn — the tool-call loop is live, though the per-conversation attachment UI and inline tool-call visualisations come in Phase 7. Windows parity comes in Phase 11. See the [roadmap](#roadmap) below.
+**Status:** v0.1.0, under active development. Phases 1–7 of the 11-phase build plan are complete and working end-to-end on macOS. Local models can invoke MCP tools during a chat turn with proper UI for managing servers, attaching them per-conversation, and approving each call inline. Windows parity comes in Phase 11. See the [roadmap](#roadmap) below.
 
 ---
 
@@ -20,12 +20,13 @@ Loom runs on **macOS** and **Windows**. Local inference uses [Ollama](https://ol
 - **Secure Electron foundation**: context isolation, sandboxed renderer, no raw `ipcRenderer` exposed, CommonJS preload, typed IPC bridge.
 - **MCP client foundation (Phase 5):** a full Model Context Protocol client registry in the main process. Spawns stdio MCP servers as child processes, handles initialization handshake, paginated tool listing, and tool invocation with result normalization. Crash recovery via the transport's `onclose` hook — dropped children are cleanly rebooted on next access. `onBeforeQuit` disconnects cleanly without orphaned processes.
 - **Tool-call loop (Phase 6):** chat turns are now a multi-iteration loop that lets any tool-capable model invoke MCP tools mid-response. Streaming tool-call deltas are reassembled from the OpenAI-compatible wire format, routed to the right MCP server through a sanitised lookup table, executed, and the results are fed back to the model as `role: 'tool'` messages — up to 12 iterations per user message. Every intermediate assistant turn and tool result is persisted to SQLite so the full agent trajectory survives app restarts. Capped at a 12-iteration budget to prevent runaway loops. Ollama and OpenAI share one implementation via `openai-compatible.ts`; Gemma 4 (and other tool-capable Ollama models) can use filesystem, memory, git, and any future MCP server today.
+- **Chat UX upgrades (Phase 7a/b):** every conversation auto-renames itself based on the first user message — instantly via a deterministic 60-character truncation, then refined a second time by a small background completion against the same Ollama model for a more human title (Ollama-only to avoid surprise token spend). The user always wins: any manual rename permanently locks the title via a `title_manually_set` flag. Live status pills now appear under the active assistant message between phases of a chat turn — "Loading gemma4:e4b into memory…", "Thinking…", "Running filesystem: list_directory…" — each with a real-time elapsed-time counter that resets at every phase boundary, so users always know what's happening even during long cold-loads or tool calls.
+- **MCP UI + bundled server presets (Phase 7c):** a real MCP server management surface. **Server Library** modal opened from the sidebar with installed servers on the left and a one-click preset catalog on the right (filesystem with directory picker, memory, plus legacy GitHub and Brave Search presets that prompt for an API key). **Server Editor** for hand-rolling a custom stdio server with command, args, and env vars. **Per-conversation tool attachment** popover in the chat header — every chat decides which servers it can use, persisted in the `conversation_servers` join table; `collectActiveTools()` now respects per-conversation attachment instead of auto-exposing every registered server. **Tool-call cards (`ToolBadge`)** render assistant tool calls and `role: 'tool'` results as collapsible cards with the tool name, server, pretty-printed JSON arguments, and result body — replacing the raw text rendering from Phase 6. **Inline approval dialogs (`ToolApprovalDialog`)** appear in the chat stream every time an MCP tool is about to run (gated by a per-conversation, per-tool policy table); three buttons: Allow once, Allow for this chat, Deny. Denied calls return a clean rejection text the model can reason about. A global `mcp.autoApproveAll` setting bypasses approvals entirely for power users (default off).
 
 ## Not yet implemented
 
 | Phase | Scope |
 |---|---|
-| 7 | MCP UI + bundled server presets (filesystem, memory, git, GitHub) — tool cards in the chat, per-conversation server attachment toggles, approval prompts |
 | 8 | BYO MCP server flow (Streamable HTTP + Claude Desktop config import) |
 | 9 | Cloud BYOK add-ons (OpenAI / Anthropic / Google via OS keychain) |
 | 10 | Polish — system prompts, dark mode toggle, shortcuts, audit log |
@@ -142,7 +143,7 @@ The complete phased build plan lives in a private plan file (`~/.claude/plans/sp
 - ✅ **Phase 4** — Model library + picker + in-chat model switching with context preservation
 - ✅ **Phase 5** — MCP client foundation (registry, stdio transport, pagination-safe listTools, callTool, crash recovery, disconnect-all on quit)
 - ✅ **Phase 6** — Tool-call loop in providers (shared OpenAI-compatible streaming with tool-call assembly, multi-turn loop with full SQLite persistence, Gemma 4 via Ollama can now invoke filesystem/memory/git/GitHub tools)
-- ⏳ **Phase 7** — MCP UI + bundled server presets
+- ✅ **Phase 7** — Chat UX upgrades (auto-rename + status pills) + MCP UI + bundled server presets (filesystem, memory, legacy github, legacy brave-search) + per-conversation tool attachment + tool-call cards + inline approval dialogs
 - ⏳ **Phase 8** — BYO MCP server flow (Streamable HTTP + clipboard import)
 - ⏳ **Phase 9** — Cloud BYOK add-ons (OpenAI / Anthropic / Google)
 - ⏳ **Phase 10** — Polish (system prompts, dark mode toggle, shortcuts, audit log)

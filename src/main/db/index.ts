@@ -4,6 +4,8 @@ import { join } from 'node:path';
 import { nanoid } from 'nanoid';
 import type {
   Conversation,
+  MCPApprovalPolicy,
+  MCPServerConfig,
   Message,
   MessageRole,
   ProviderId,
@@ -409,5 +411,198 @@ export const settingsDb = {
 
   remove(key: string): void {
     requireDb().prepare('DELETE FROM settings WHERE key = ?').run(key);
+  }
+};
+
+// ----- MCP servers (Phase 7) -----
+//
+// One row per user-configured MCP server. Loaded at app boot and
+// registered with the live registry so connections are lazily
+// established on first use. Bundled preset installs write rows here
+// too — they're not special at the storage layer, they just have a
+// `source` value of 'bundled'.
+
+interface McpServerRow {
+  id: string;
+  name: string;
+  transport: string;
+  config: string;
+  enabled: number;
+  source: string;
+  created_at: number;
+  updated_at: number;
+}
+
+function mcpServerFromRow(row: McpServerRow): MCPServerConfig {
+  const extras = JSON.parse(row.config) as Record<string, unknown>;
+  if (row.transport === 'stdio') {
+    return {
+      id: row.id,
+      name: row.name,
+      enabled: row.enabled === 1,
+      source: row.source as 'bundled' | 'user',
+      transport: 'stdio',
+      command: String(extras['command'] ?? ''),
+      args: (extras['args'] as string[] | undefined) ?? undefined,
+      env: (extras['env'] as Record<string, string> | undefined) ?? undefined
+    };
+  }
+  return {
+    id: row.id,
+    name: row.name,
+    enabled: row.enabled === 1,
+    source: row.source as 'bundled' | 'user',
+    transport: 'http',
+    url: String(extras['url'] ?? ''),
+    headers:
+      (extras['headers'] as Record<string, string> | undefined) ?? undefined
+  };
+}
+
+function mcpConfigToBlob(config: MCPServerConfig): string {
+  if (config.transport === 'stdio') {
+    return JSON.stringify({
+      command: config.command,
+      args: config.args ?? [],
+      env: config.env ?? {}
+    });
+  }
+  return JSON.stringify({
+    url: config.url,
+    headers: config.headers ?? {}
+  });
+}
+
+export const mcpServersDb = {
+  list(): MCPServerConfig[] {
+    const rows = requireDb()
+      .prepare<[], McpServerRow>(
+        'SELECT * FROM mcp_servers ORDER BY source DESC, name ASC'
+      )
+      .all();
+    return rows.map(mcpServerFromRow);
+  },
+
+  get(id: string): MCPServerConfig | null {
+    const row = requireDb()
+      .prepare<[string], McpServerRow>('SELECT * FROM mcp_servers WHERE id = ?')
+      .get(id);
+    return row ? mcpServerFromRow(row) : null;
+  },
+
+  upsert(config: MCPServerConfig): void {
+    const now = Date.now();
+    const existing = this.get(config.id);
+    if (existing) {
+      requireDb()
+        .prepare(
+          `UPDATE mcp_servers
+           SET name = ?, transport = ?, config = ?, enabled = ?, source = ?, updated_at = ?
+           WHERE id = ?`
+        )
+        .run(
+          config.name,
+          config.transport,
+          mcpConfigToBlob(config),
+          config.enabled ? 1 : 0,
+          config.source,
+          now,
+          config.id
+        );
+    } else {
+      requireDb()
+        .prepare(
+          `INSERT INTO mcp_servers
+           (id, name, transport, config, enabled, source, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+        )
+        .run(
+          config.id,
+          config.name,
+          config.transport,
+          mcpConfigToBlob(config),
+          config.enabled ? 1 : 0,
+          config.source,
+          now,
+          now
+        );
+    }
+  },
+
+  remove(id: string): void {
+    requireDb().prepare('DELETE FROM mcp_servers WHERE id = ?').run(id);
+  },
+
+  newId(): string {
+    return nanoid();
+  }
+};
+
+// ----- Per-conversation server attachment (Phase 7) -----
+
+export const conversationServersDb = {
+  list(conversationId: string): string[] {
+    const rows = requireDb()
+      .prepare<[string], { server_id: string }>(
+        'SELECT server_id FROM conversation_servers WHERE conversation_id = ?'
+      )
+      .all(conversationId);
+    return rows.map((r) => r.server_id);
+  },
+
+  /** Replace the full attachment set in a single transaction. */
+  setAll(conversationId: string, serverIds: string[]): void {
+    const db = requireDb();
+    const tx = db.transaction(() => {
+      db.prepare(
+        'DELETE FROM conversation_servers WHERE conversation_id = ?'
+      ).run(conversationId);
+      const insert = db.prepare(
+        `INSERT INTO conversation_servers (conversation_id, server_id)
+         VALUES (?, ?)`
+      );
+      for (const id of serverIds) {
+        insert.run(conversationId, id);
+      }
+    });
+    tx();
+  }
+};
+
+// ----- Tool approvals (Phase 7) -----
+
+export const toolApprovalsDb = {
+  get(
+    conversationId: string,
+    serverId: string,
+    toolName: string
+  ): MCPApprovalPolicy | null {
+    const row = requireDb()
+      .prepare<[string, string, string], { policy: string }>(
+        `SELECT policy FROM tool_approvals
+         WHERE conversation_id = ? AND server_id = ? AND tool_name = ?`
+      )
+      .get(conversationId, serverId, toolName);
+    if (!row) return null;
+    return row.policy === 'always' || row.policy === 'never'
+      ? (row.policy as MCPApprovalPolicy)
+      : null;
+  },
+
+  set(
+    conversationId: string,
+    serverId: string,
+    toolName: string,
+    policy: MCPApprovalPolicy
+  ): void {
+    requireDb()
+      .prepare(
+        `INSERT INTO tool_approvals
+           (conversation_id, server_id, tool_name, policy)
+         VALUES (?, ?, ?, ?)
+         ON CONFLICT(conversation_id, server_id, tool_name)
+         DO UPDATE SET policy = excluded.policy`
+      )
+      .run(conversationId, serverId, toolName, policy);
   }
 };
