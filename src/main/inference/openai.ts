@@ -2,10 +2,10 @@ import OpenAI from 'openai';
 import type {
   ListedModel,
   Provider,
-  ProviderChatMessage,
   ProviderChatRequest,
   ProviderStreamEvent
 } from './provider';
+import { streamOpenAICompatible } from './openai-compatible';
 import { settingsDb } from '../db';
 
 // A curated fallback list used before `listModels()` fetches the live catalog.
@@ -26,24 +26,6 @@ function buildClient(): OpenAI | null {
   const apiKey = getApiKey();
   if (!apiKey) return null;
   return new OpenAI({ apiKey });
-}
-
-function toOpenAiMessages(
-  messages: ProviderChatMessage[]
-): OpenAI.Chat.Completions.ChatCompletionMessageParam[] {
-  return messages.map((m) => {
-    switch (m.role) {
-      case 'system':
-      case 'user':
-        return { role: m.role, content: m.content };
-      case 'assistant':
-        return { role: 'assistant', content: m.content };
-      case 'tool':
-        // Tool messages become OpenAI's `tool` role in Phase 7; for now the
-        // tool-call loop is inactive and this branch is unreachable.
-        return { role: 'tool', tool_call_id: m.toolCallId, content: m.content };
-    }
-  });
 }
 
 export const openAiProvider: Provider = {
@@ -80,48 +62,6 @@ export const openAiProvider: Provider = {
       };
       return;
     }
-
-    try {
-      const stream = await client.chat.completions.create(
-        {
-          model: req.model,
-          messages: toOpenAiMessages(req.messages),
-          temperature: req.temperature,
-          max_tokens: req.maxTokens,
-          stream: true,
-          stream_options: { include_usage: true }
-        },
-        { signal: req.signal }
-      );
-
-      let promptTokens = 0;
-      let completionTokens = 0;
-
-      for await (const chunk of stream) {
-        if (req.signal.aborted) break;
-        const choice = chunk.choices[0];
-        if (choice?.delta?.content) {
-          yield { type: 'delta', delta: choice.delta.content };
-        }
-        if (chunk.usage) {
-          promptTokens = chunk.usage.prompt_tokens;
-          completionTokens = chunk.usage.completion_tokens;
-        }
-      }
-
-      yield {
-        type: 'done',
-        usage: { promptTokens, completionTokens }
-      };
-    } catch (err) {
-      if (req.signal.aborted) {
-        yield { type: 'done' };
-        return;
-      }
-      yield {
-        type: 'error',
-        error: err instanceof Error ? err.message : 'Unknown OpenAI error'
-      };
-    }
+    yield* streamOpenAICompatible(client, req);
   }
 };

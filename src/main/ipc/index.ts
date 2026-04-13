@@ -17,13 +17,19 @@ import {
   cancelPull
 } from '../ollama/models';
 import { CURATED_MODELS } from '../ollama/curated';
+import {
+  collectActiveTools,
+  routeToolCall,
+  MAX_TOOL_ITERATIONS
+} from '../mcp/tool-loop';
 import type {
   ChatSendInput,
   ChatStreamEvent,
   Conversation,
   Message,
   OllamaStatus,
-  ProviderId
+  ProviderId,
+  ToolCall
 } from '../../shared/types';
 
 // One AbortController per in-flight chat request, keyed by conversationId.
@@ -40,6 +46,42 @@ function broadcastOllamaStatus(status: OllamaStatus): void {
   for (const win of BrowserWindow.getAllWindows()) {
     win.webContents.send('ollama:status', status);
   }
+}
+
+/**
+ * Walk the persisted messages for a conversation and project each row
+ * into a ProviderChatMessage. Preserves tool_calls on assistant rows
+ * and tool_call_id on role='tool' rows so round-trips through SQLite
+ * don't lose any structure the provider needs to replay a tool-use
+ * turn.
+ */
+function buildHistory(conversationId: string): ProviderChatMessage[] {
+  const rows = messagesDb.listForConversation(conversationId);
+  return rows.map<ProviderChatMessage>((m) => {
+    if (m.role === 'user' || m.role === 'system') {
+      return { role: m.role, content: m.content };
+    }
+    if (m.role === 'assistant') {
+      const msg: ProviderChatMessage = {
+        role: 'assistant',
+        content: m.content
+      };
+      if (m.toolCalls && m.toolCalls.length > 0) {
+        msg.toolCalls = m.toolCalls.map((tc) => ({
+          id: tc.id,
+          name: tc.name,
+          arguments: tc.arguments
+        }));
+      }
+      return msg;
+    }
+    // role === 'tool'
+    return {
+      role: 'tool',
+      toolCallId: m.toolCallId ?? '',
+      content: m.content
+    };
+  });
 }
 
 export function registerIpcHandlers(): void {
@@ -107,106 +149,225 @@ export function registerIpcHandlers(): void {
     messagesDb.listForConversation(id)
   );
 
-  // ----- Chat -----
+  // ----- Chat (Phase 6: multi-turn tool-call loop) -----
   ipcMain.handle('chat:send', async (_e, input: ChatSendInput) => {
     const conversation = conversationsDb.get(input.conversationId);
     if (!conversation) throw new Error('Conversation not found');
 
-    // 1. Persist the user's message.
+    // 1. Persist the user message up front so it survives any error below.
     const userMsg = messagesDb.insert({
       conversationId: conversation.id,
       role: 'user',
       content: input.content
     });
-
-    // 2. Seed an empty assistant placeholder so the renderer has an id to
-    //    attach streaming deltas to. The tool-call loop (Phase 7) will later
-    //    append tool_call entries to this same message id.
-    const assistantMsg = messagesDb.insert({
+    send({
+      type: 'delta',
       conversationId: conversation.id,
-      role: 'assistant',
-      content: ''
+      messageId: userMsg.id,
+      delta: ''
     });
 
-    send({ type: 'delta', conversationId: conversation.id, messageId: userMsg.id, delta: '' });
+    // 2. Build the provider's initial message history from everything
+    //    already persisted in SQLite. This is what lets a new model see
+    //    the entire prior conversation after a mid-chat switch.
+    const systemMessages: ProviderChatMessage[] = conversation.systemPrompt
+      ? [{ role: 'system', content: conversation.systemPrompt }]
+      : [];
+    let messages: ProviderChatMessage[] = [
+      ...systemMessages,
+      ...buildHistory(conversation.id)
+    ];
 
-    // 3. Build the provider prompt from the full persisted history so context
-    //    survives app restarts automatically.
-    const history = messagesDb
-      .listForConversation(conversation.id)
-      .filter((m) => m.id !== assistantMsg.id)
-      .map<ProviderChatMessage>((m) => {
-        if (m.role === 'user' || m.role === 'system') {
-          return { role: m.role, content: m.content };
-        }
-        if (m.role === 'assistant') {
-          return { role: 'assistant', content: m.content };
-        }
-        // Phase 7 adds tool-result handling; for now treat as plain content.
-        return { role: 'assistant', content: m.content };
-      });
-
-    const messages: ProviderChatMessage[] = [];
-    if (conversation.systemPrompt) {
-      messages.push({ role: 'system', content: conversation.systemPrompt });
-    }
-    messages.push(...history);
+    // 3. Resolve the active MCP tool catalog. Phase 6 exposes EVERY
+    //    registered MCP server to EVERY chat — per-conversation
+    //    attachment comes in Phase 7.
+    const provider = getProvider(conversation.provider);
+    const activeTools = provider.supportsTools
+      ? await collectActiveTools()
+      : { tools: [], routes: new Map() };
 
     const controller = new AbortController();
     inflight.set(conversation.id, controller);
 
-    let accumulated = '';
+    let finalAssistantId: string | null = null;
+
     try {
-      const provider = getProvider(conversation.provider);
-      for await (const event of provider.stream({
-        conversationId: conversation.id,
-        messages,
-        model: conversation.modelId,
-        signal: controller.signal
-      })) {
-        if (event.type === 'delta' && event.delta) {
-          accumulated += event.delta;
-          send({
-            type: 'delta',
-            conversationId: conversation.id,
-            messageId: assistantMsg.id,
-            delta: event.delta
-          });
-        } else if (event.type === 'done') {
-          messagesDb.updateContent(
-            assistantMsg.id,
-            accumulated,
-            event.usage
-          );
+      // 4. Multi-turn loop. Each iteration:
+      //    - Creates a fresh assistant placeholder row
+      //    - Streams one turn from the provider
+      //    - If the turn ended with tool calls, executes them, persists
+      //      each result as its own `role: 'tool'` message, and loops
+      //    - If the turn ended with plain text, we're done
+      for (let iter = 0; iter < MAX_TOOL_ITERATIONS; iter++) {
+        const assistantMsg = messagesDb.insert({
+          conversationId: conversation.id,
+          role: 'assistant',
+          content: ''
+        });
+        finalAssistantId = assistantMsg.id;
+        send({
+          type: 'delta',
+          conversationId: conversation.id,
+          messageId: assistantMsg.id,
+          delta: ''
+        });
+
+        let accumulated = '';
+        const pendingCalls: ToolCall[] = [];
+        let iterDone = false;
+        let iterErrored = false;
+        let usage: { promptTokens: number; completionTokens: number } | undefined;
+
+        for await (const event of provider.stream({
+          conversationId: conversation.id,
+          messages,
+          model: conversation.modelId,
+          tools: activeTools.tools.length > 0 ? activeTools.tools : undefined,
+          signal: controller.signal
+        })) {
+          if (event.type === 'delta' && event.delta) {
+            accumulated += event.delta;
+            send({
+              type: 'delta',
+              conversationId: conversation.id,
+              messageId: assistantMsg.id,
+              delta: event.delta
+            });
+          } else if (event.type === 'tool_call' && event.toolCall) {
+            // Resolve serverId so downstream consumers (renderer cards,
+            // DB persistence, re-routing) have the complete picture.
+            const route = activeTools.routes.get(event.toolCall.name);
+            const resolved: ToolCall = {
+              id: event.toolCall.id,
+              serverId: route?.serverId ?? '',
+              name: event.toolCall.name,
+              arguments: event.toolCall.arguments
+            };
+            pendingCalls.push(resolved);
+            send({
+              type: 'tool_call',
+              conversationId: conversation.id,
+              messageId: assistantMsg.id,
+              toolCall: resolved
+            });
+          } else if (event.type === 'done') {
+            usage = event.usage;
+            iterDone = true;
+            break;
+          } else if (event.type === 'error') {
+            iterErrored = true;
+            send({
+              type: 'error',
+              conversationId: conversation.id,
+              messageId: assistantMsg.id,
+              error: event.error
+            });
+            break;
+          }
+        }
+
+        // Persist whatever we captured this iteration.
+        messagesDb.finaliseAssistant(
+          assistantMsg.id,
+          accumulated,
+          pendingCalls.length > 0 ? pendingCalls : undefined,
+          usage
+        );
+
+        // Append the assistant turn to the in-flight history so the
+        // next iteration (and any tool messages that follow) see it.
+        messages = [
+          ...messages,
+          {
+            role: 'assistant',
+            content: accumulated,
+            toolCalls:
+              pendingCalls.length > 0
+                ? pendingCalls.map((c) => ({
+                    id: c.id,
+                    name: c.name,
+                    arguments: c.arguments
+                  }))
+                : undefined
+          }
+        ];
+
+        if (iterErrored) return;
+
+        if (!iterDone || pendingCalls.length === 0) {
+          // Stream ended cleanly with no tool calls → conversation
+          // complete. Notify the renderer and stop looping.
           send({
             type: 'done',
             conversationId: conversation.id,
             messageId: assistantMsg.id,
-            usage: event.usage
+            usage
           });
-        } else if (event.type === 'error') {
-          messagesDb.updateContent(assistantMsg.id, accumulated);
-          send({
-            type: 'error',
-            conversationId: conversation.id,
-            messageId: assistantMsg.id,
-            error: event.error
-          });
+          return;
         }
+
+        // 5. Execute every pending tool call, persisting each result
+        //    as its own `role: 'tool'` message.
+        for (const call of pendingCalls) {
+          if (controller.signal.aborted) return;
+          const { resultText, isError, durationMs } = await routeToolCall(
+            activeTools.routes,
+            { id: call.id, name: call.name, arguments: call.arguments }
+          );
+
+          const toolMsg = messagesDb.insert({
+            conversationId: conversation.id,
+            role: 'tool',
+            content: resultText,
+            toolCallId: call.id
+          });
+
+          send({
+            type: 'tool_result',
+            conversationId: conversation.id,
+            messageId: toolMsg.id,
+            toolCallId: call.id,
+            toolResult: resultText
+          });
+
+          if (isError) {
+            console.warn(
+              `[chat] tool '${call.name}' reported error in ${durationMs}ms`
+            );
+          }
+
+          messages = [
+            ...messages,
+            { role: 'tool', toolCallId: call.id, content: resultText }
+          ];
+        }
+
+        // Fall through → the next iteration asks the provider to
+        // continue given the tool results.
       }
-    } catch (err) {
-      messagesDb.updateContent(assistantMsg.id, accumulated);
+
+      // Hit the iteration cap without the model converging.
       send({
         type: 'error',
         conversationId: conversation.id,
-        messageId: assistantMsg.id,
-        error: err instanceof Error ? err.message : 'Unknown error'
+        messageId: finalAssistantId ?? undefined,
+        error: `Tool-call loop exceeded ${MAX_TOOL_ITERATIONS} iterations without a plain-text response.`
+      });
+    } catch (err) {
+      send({
+        type: 'error',
+        conversationId: conversation.id,
+        messageId: finalAssistantId ?? undefined,
+        error: err instanceof Error ? err.message : 'Unknown chat error'
       });
     } finally {
       inflight.delete(conversation.id);
     }
 
-    return { userMessageId: userMsg.id, assistantMessageId: assistantMsg.id };
+    return {
+      userMessageId: userMsg.id,
+      assistantMessageId: finalAssistantId ?? userMsg.id
+    };
   });
 
   ipcMain.handle('chat:abort', (_e, conversationId: string) => {

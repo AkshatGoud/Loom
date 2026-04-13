@@ -24,6 +24,18 @@ export interface Message {
   tokensPrompt: number | null;
   tokensCompletion: number | null;
   createdAt: number;
+  /**
+   * Assistant messages that triggered MCP tool calls carry the list of
+   * calls here. The matching tool-result messages (role='tool') come as
+   * separate rows with their `toolCallId` populated.
+   */
+  toolCalls?: ToolCall[];
+  /**
+   * For role='tool' messages, the id of the tool_call this message is
+   * responding to. Matches the `id` on a ToolCall in a prior assistant
+   * message within the same conversation.
+   */
+  toolCallId?: string;
 }
 
 export interface ListedModel {

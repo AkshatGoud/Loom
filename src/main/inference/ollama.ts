@@ -2,19 +2,22 @@ import OpenAI from 'openai';
 import type {
   ListedModel,
   Provider,
-  ProviderChatMessage,
   ProviderChatRequest,
   ProviderStreamEvent
 } from './provider';
+import { streamOpenAICompatible } from './openai-compatible';
 import { OLLAMA_BASE_URL, getOllamaStatus } from '../ollama/daemon';
 
-// Ollama exposes two chat surfaces:
-//   1. /v1/chat/completions — OpenAI-compatible. We use this for streaming,
-//      so we reuse the `openai` SDK with a different baseURL.
-//   2. /api/tags — native endpoint that lists *pulled* models with tag,
-//      size, and digest. We call this directly (not via SDK) because the
-//      OpenAI-compat /v1/models endpoint doesn't give us the same detail
-//      and sometimes omits recently-pulled models.
+/**
+ * Ollama provider. Runs local LLMs through the user-installed Ollama
+ * daemon. Uses Ollama's OpenAI-compatible `/v1/chat/completions`
+ * endpoint so we can share every byte of streaming + tool-calling code
+ * with the real OpenAI provider (see ./openai-compatible.ts).
+ *
+ * Model management (pull, delete, show, ps) lives in ../ollama/models.ts
+ * and hits Ollama's native `/api/*` endpoints because the OpenAI-compat
+ * surface doesn't expose them.
+ */
 
 function buildClient(): OpenAI {
   return new OpenAI({
@@ -28,24 +31,12 @@ interface TagsResponse {
     name: string;
     size: number;
     digest: string;
-    details?: { family?: string; parameter_size?: string; quantization_level?: string };
+    details?: {
+      family?: string;
+      parameter_size?: string;
+      quantization_level?: string;
+    };
   }>;
-}
-
-function toOpenAiMessages(
-  messages: ProviderChatMessage[]
-): OpenAI.Chat.Completions.ChatCompletionMessageParam[] {
-  return messages.map((m) => {
-    switch (m.role) {
-      case 'system':
-      case 'user':
-        return { role: m.role, content: m.content };
-      case 'assistant':
-        return { role: 'assistant', content: m.content };
-      case 'tool':
-        return { role: 'tool', tool_call_id: m.toolCallId, content: m.content };
-    }
-  });
 }
 
 export const ollamaProvider: Provider = {
@@ -88,49 +79,6 @@ export const ollamaProvider: Provider = {
     }
 
     const client = buildClient();
-
-    try {
-      const stream = await client.chat.completions.create(
-        {
-          model: req.model,
-          messages: toOpenAiMessages(req.messages),
-          temperature: req.temperature,
-          max_tokens: req.maxTokens,
-          stream: true,
-          stream_options: { include_usage: true }
-        },
-        { signal: req.signal }
-      );
-
-      let promptTokens = 0;
-      let completionTokens = 0;
-
-      for await (const chunk of stream) {
-        if (req.signal.aborted) break;
-        const choice = chunk.choices[0];
-        if (choice?.delta?.content) {
-          yield { type: 'delta', delta: choice.delta.content };
-        }
-        if (chunk.usage) {
-          promptTokens = chunk.usage.prompt_tokens;
-          completionTokens = chunk.usage.completion_tokens;
-        }
-      }
-
-      yield {
-        type: 'done',
-        usage: { promptTokens, completionTokens }
-      };
-    } catch (err) {
-      if (req.signal.aborted) {
-        yield { type: 'done' };
-        return;
-      }
-      const message =
-        err instanceof Error
-          ? err.message
-          : 'Unknown error talking to Ollama daemon';
-      yield { type: 'error', error: message };
-    }
+    yield* streamOpenAICompatible(client, req);
   }
 };

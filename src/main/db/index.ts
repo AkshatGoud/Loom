@@ -6,7 +6,8 @@ import type {
   Conversation,
   Message,
   MessageRole,
-  ProviderId
+  ProviderId,
+  ToolCall
 } from '../../shared/types';
 // Vite inlines the SQL file at build time via ?raw — no runtime fs access needed.
 import schema from './schema.sql?raw';
@@ -32,6 +33,8 @@ interface MessageRow {
   tokens_prompt: number | null;
   tokens_completion: number | null;
   created_at: number;
+  tool_calls_json: string | null;
+  tool_call_id: string | null;
 }
 
 // ----- DB singleton -----
@@ -47,8 +50,28 @@ export function initDb(): Database.Database {
   db.pragma('foreign_keys = ON');
 
   db.exec(schema);
+  runMigrations(db);
 
   return db;
+}
+
+/**
+ * Idempotent schema upgrade pass. SQLite's `ALTER TABLE ADD COLUMN`
+ * errors if the column already exists, so we check `PRAGMA table_info`
+ * first. New installs get the columns via schema.sql; this only runs
+ * against databases created on an earlier Loom build.
+ */
+function runMigrations(database: Database.Database): void {
+  const cols = database
+    .prepare("PRAGMA table_info(messages)")
+    .all() as { name: string }[];
+  const names = new Set(cols.map((c) => c.name));
+  if (!names.has('tool_calls_json')) {
+    database.exec('ALTER TABLE messages ADD COLUMN tool_calls_json TEXT');
+  }
+  if (!names.has('tool_call_id')) {
+    database.exec('ALTER TABLE messages ADD COLUMN tool_call_id TEXT');
+  }
 }
 
 function requireDb(): Database.Database {
@@ -72,7 +95,7 @@ function conversationFromRow(row: ConversationRow): Conversation {
 }
 
 function messageFromRow(row: MessageRow): Message {
-  return {
+  const message: Message = {
     id: row.id,
     conversationId: row.conversation_id,
     role: row.role as MessageRole,
@@ -81,6 +104,17 @@ function messageFromRow(row: MessageRow): Message {
     tokensCompletion: row.tokens_completion,
     createdAt: row.created_at
   };
+  if (row.tool_calls_json) {
+    try {
+      message.toolCalls = JSON.parse(row.tool_calls_json) as ToolCall[];
+    } catch {
+      /* corrupted blob — ignore */
+    }
+  }
+  if (row.tool_call_id) {
+    message.toolCallId = row.tool_call_id;
+  }
+  return message;
 }
 
 // ----- Conversation queries -----
@@ -182,13 +216,20 @@ export const messagesDb = {
     content: string;
     tokensPrompt?: number | null;
     tokensCompletion?: number | null;
+    toolCalls?: ToolCall[];
+    toolCallId?: string;
   }): Message {
     const id = nanoid();
     const now = Date.now();
+    const toolCallsJson =
+      input.toolCalls && input.toolCalls.length > 0
+        ? JSON.stringify(input.toolCalls)
+        : null;
     requireDb()
       .prepare(
-        `INSERT INTO messages (id, conversation_id, role, content, tokens_prompt, tokens_completion, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?)`
+        `INSERT INTO messages
+         (id, conversation_id, role, content, tokens_prompt, tokens_completion, created_at, tool_calls_json, tool_call_id)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
       )
       .run(
         id,
@@ -197,7 +238,9 @@ export const messagesDb = {
         input.content,
         input.tokensPrompt ?? null,
         input.tokensCompletion ?? null,
-        now
+        now,
+        toolCallsJson,
+        input.toolCallId ?? null
       );
     conversationsDb.touch(input.conversationId);
     return {
@@ -207,7 +250,11 @@ export const messagesDb = {
       content: input.content,
       tokensPrompt: input.tokensPrompt ?? null,
       tokensCompletion: input.tokensCompletion ?? null,
-      createdAt: now
+      createdAt: now,
+      ...(input.toolCalls && input.toolCalls.length > 0
+        ? { toolCalls: input.toolCalls }
+        : {}),
+      ...(input.toolCallId ? { toolCallId: input.toolCallId } : {})
     };
   },
 
@@ -220,6 +267,42 @@ export const messagesDb = {
         .run(content, usage.promptTokens, usage.completionTokens, id);
     } else {
       requireDb().prepare('UPDATE messages SET content = ? WHERE id = ?').run(content, id);
+    }
+  },
+
+  /**
+   * Finalise an assistant message at the end of a streaming turn: set
+   * the accumulated content, the tool_calls blob (if any), and the
+   * usage stats. Used by the Phase 6 tool-call loop in chat:send.
+   */
+  finaliseAssistant(
+    id: string,
+    content: string,
+    toolCalls: ToolCall[] | undefined,
+    usage?: { promptTokens: number; completionTokens: number }
+  ): void {
+    const toolCallsJson =
+      toolCalls && toolCalls.length > 0 ? JSON.stringify(toolCalls) : null;
+    if (usage) {
+      requireDb()
+        .prepare(
+          `UPDATE messages
+           SET content = ?, tool_calls_json = ?, tokens_prompt = ?, tokens_completion = ?
+           WHERE id = ?`
+        )
+        .run(
+          content,
+          toolCallsJson,
+          usage.promptTokens,
+          usage.completionTokens,
+          id
+        );
+    } else {
+      requireDb()
+        .prepare(
+          'UPDATE messages SET content = ?, tool_calls_json = ? WHERE id = ?'
+        )
+        .run(content, toolCallsJson, id);
     }
   },
 

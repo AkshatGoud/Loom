@@ -4,7 +4,7 @@ A professional desktop chat app for local LLMs via Ollama and cloud LLMs via BYO
 
 Loom runs on **macOS** and **Windows**. Local inference uses [Ollama](https://ollama.com) — users install Ollama separately, and Loom detects, connects to, and manages models through it. Cloud providers (OpenAI / Anthropic / Google) are supported via BYOK as optional add-ons.
 
-**Status:** v0.1.0, under active development. Phases 1–5 of the 11-phase build plan are complete and working end-to-end on macOS. The MCP client foundation (Phase 5) runs but is not yet wired into chat — that happens in Phase 6 (tool-call loop) and Phase 7 (UI). Windows parity comes in Phase 11. See the [roadmap](#roadmap) below.
+**Status:** v0.1.0, under active development. Phases 1–6 of the 11-phase build plan are complete and working end-to-end on macOS. Local models can now invoke MCP tools during a chat turn — the tool-call loop is live, though the per-conversation attachment UI and inline tool-call visualisations come in Phase 7. Windows parity comes in Phase 11. See the [roadmap](#roadmap) below.
 
 ---
 
@@ -18,14 +18,14 @@ Loom runs on **macOS** and **Windows**. Local inference uses [Ollama](https://ol
 - **Multi-conversation chat** with SQLite-persisted history. Conversations survive app restarts with full message history, system prompts, and token counts.
 - **Streaming chat UI** with markdown rendering, code block highlighting, stop-mid-stream, and auto-scroll.
 - **Secure Electron foundation**: context isolation, sandboxed renderer, no raw `ipcRenderer` exposed, CommonJS preload, typed IPC bridge.
-- **MCP client foundation (Phase 5, no UI yet):** a full Model Context Protocol client registry in the main process. Spawns stdio MCP servers as child processes, handles initialization handshake, paginated tool listing, and tool invocation with result normalization. Crash recovery via the transport's `onclose` hook — dropped children are cleanly rebooted on next access. Verified end-to-end against `@modelcontextprotocol/server-filesystem` at boot time (dev mode only): 14 tools discovered, `list_directory` invoked against the user's home dir, `onBeforeQuit` disconnects cleanly without orphaned processes.
+- **MCP client foundation (Phase 5):** a full Model Context Protocol client registry in the main process. Spawns stdio MCP servers as child processes, handles initialization handshake, paginated tool listing, and tool invocation with result normalization. Crash recovery via the transport's `onclose` hook — dropped children are cleanly rebooted on next access. `onBeforeQuit` disconnects cleanly without orphaned processes.
+- **Tool-call loop (Phase 6):** chat turns are now a multi-iteration loop that lets any tool-capable model invoke MCP tools mid-response. Streaming tool-call deltas are reassembled from the OpenAI-compatible wire format, routed to the right MCP server through a sanitised lookup table, executed, and the results are fed back to the model as `role: 'tool'` messages — up to 12 iterations per user message. Every intermediate assistant turn and tool result is persisted to SQLite so the full agent trajectory survives app restarts. Capped at a 12-iteration budget to prevent runaway loops. Ollama and OpenAI share one implementation via `openai-compatible.ts`; Gemma 4 (and other tool-capable Ollama models) can use filesystem, memory, git, and any future MCP server today.
 
 ## Not yet implemented
 
 | Phase | Scope |
 |---|---|
-| 6 | Tool-call loop in providers (Ollama inherits tool calling for free via OpenAI-compatible endpoint) |
-| 7 | MCP UI + bundled server presets (filesystem, memory, git, GitHub) |
+| 7 | MCP UI + bundled server presets (filesystem, memory, git, GitHub) — tool cards in the chat, per-conversation server attachment toggles, approval prompts |
 | 8 | BYO MCP server flow (Streamable HTTP + Claude Desktop config import) |
 | 9 | Cloud BYOK add-ons (OpenAI / Anthropic / Google via OS keychain) |
 | 10 | Polish — system prompts, dark mode toggle, shortcuts, audit log |
@@ -141,7 +141,7 @@ The complete phased build plan lives in a private plan file (`~/.claude/plans/sp
 - ✅ **Phase 3** — Ollama provider + first-run onboarding
 - ✅ **Phase 4** — Model library + picker + in-chat model switching with context preservation
 - ✅ **Phase 5** — MCP client foundation (registry, stdio transport, pagination-safe listTools, callTool, crash recovery, disconnect-all on quit)
-- ⏳ **Phase 6** — Tool-call loop in providers
+- ✅ **Phase 6** — Tool-call loop in providers (shared OpenAI-compatible streaming with tool-call assembly, multi-turn loop with full SQLite persistence, Gemma 4 via Ollama can now invoke filesystem/memory/git/GitHub tools)
 - ⏳ **Phase 7** — MCP UI + bundled server presets
 - ⏳ **Phase 8** — BYO MCP server flow (Streamable HTTP + clipboard import)
 - ⏳ **Phase 9** — Cloud BYOK add-ons (OpenAI / Anthropic / Google)

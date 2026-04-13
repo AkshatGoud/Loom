@@ -22,7 +22,10 @@ CREATE TABLE IF NOT EXISTS messages (
   content           TEXT NOT NULL,
   tokens_prompt     INTEGER,
   tokens_completion INTEGER,
-  created_at        INTEGER NOT NULL
+  created_at        INTEGER NOT NULL,
+  -- Phase 6: MCP tool calling
+  tool_calls_json   TEXT,      -- JSON array of ToolCall, set on assistant messages that triggered MCP tools
+  tool_call_id      TEXT       -- set on role='tool' messages, links back to the ToolCall.id in a prior assistant row
 );
 
 CREATE INDEX IF NOT EXISTS idx_messages_conversation
