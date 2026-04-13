@@ -4,7 +4,7 @@ A professional desktop chat app for local LLMs via Ollama and cloud LLMs via BYO
 
 Loom runs on **macOS** and **Windows**. Local inference uses [Ollama](https://ollama.com) — users install Ollama separately, and Loom detects, connects to, and manages models through it. Cloud providers (OpenAI / Anthropic / Google) are supported via BYOK as optional add-ons.
 
-**Status:** v0.1.0, under active development. Phases 1–4 of the 11-phase build plan are complete and working end-to-end on macOS. Windows parity and the MCP subsystem come in later phases. See the [roadmap](#roadmap) below.
+**Status:** v0.1.0, under active development. Phases 1–5 of the 11-phase build plan are complete and working end-to-end on macOS. The MCP client foundation (Phase 5) runs but is not yet wired into chat — that happens in Phase 6 (tool-call loop) and Phase 7 (UI). Windows parity comes in Phase 11. See the [roadmap](#roadmap) below.
 
 ---
 
@@ -18,12 +18,12 @@ Loom runs on **macOS** and **Windows**. Local inference uses [Ollama](https://ol
 - **Multi-conversation chat** with SQLite-persisted history. Conversations survive app restarts with full message history, system prompts, and token counts.
 - **Streaming chat UI** with markdown rendering, code block highlighting, stop-mid-stream, and auto-scroll.
 - **Secure Electron foundation**: context isolation, sandboxed renderer, no raw `ipcRenderer` exposed, CommonJS preload, typed IPC bridge.
+- **MCP client foundation (Phase 5, no UI yet):** a full Model Context Protocol client registry in the main process. Spawns stdio MCP servers as child processes, handles initialization handshake, paginated tool listing, and tool invocation with result normalization. Crash recovery via the transport's `onclose` hook — dropped children are cleanly rebooted on next access. Verified end-to-end against `@modelcontextprotocol/server-filesystem` at boot time (dev mode only): 14 tools discovered, `list_directory` invoked against the user's home dir, `onBeforeQuit` disconnects cleanly without orphaned processes.
 
 ## Not yet implemented
 
 | Phase | Scope |
 |---|---|
-| 5 | MCP client foundation (registry, stdio transport, listTools) |
 | 6 | Tool-call loop in providers (Ollama inherits tool calling for free via OpenAI-compatible endpoint) |
 | 7 | MCP UI + bundled server presets (filesystem, memory, git, GitHub) |
 | 8 | BYO MCP server flow (Streamable HTTP + Claude Desktop config import) |
@@ -106,6 +106,7 @@ src/
 │   ├── ipc/                     # typed IPC handlers
 │   ├── inference/               # Provider interface + adapters
 │   ├── ollama/                  # daemon detection, /api/* wrapper, curated catalog
+│   ├── mcp/                     # MCP client registry, client factory, stdio transport
 │   └── db/                      # SQLite schema + queries via better-sqlite3
 ├── preload/                     # contextBridge → window.api  (CommonJS .cjs)
 ├── renderer/                    # React app (Vite)
@@ -139,7 +140,7 @@ The complete phased build plan lives in a private plan file (`~/.claude/plans/sp
 - ✅ **Phase 2** — Provider interface, OpenAI adapter as validator, SQLite persistence, chat UI
 - ✅ **Phase 3** — Ollama provider + first-run onboarding
 - ✅ **Phase 4** — Model library + picker + in-chat model switching with context preservation
-- ⏳ **Phase 5** — MCP client foundation
+- ✅ **Phase 5** — MCP client foundation (registry, stdio transport, pagination-safe listTools, callTool, crash recovery, disconnect-all on quit)
 - ⏳ **Phase 6** — Tool-call loop in providers
 - ⏳ **Phase 7** — MCP UI + bundled server presets
 - ⏳ **Phase 8** — BYO MCP server flow (Streamable HTTP + clipboard import)

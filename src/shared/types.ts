@@ -98,6 +98,84 @@ export interface ModelShowDetails {
   template: string | null;
 }
 
+// ----- MCP (Phase 5+) -----
+
+/**
+ * Persistent configuration for a single MCP server. Stored in the
+ * `mcp_servers` SQLite table (Phase 7+) and passed to the client
+ * factory whenever a new connection is created.
+ *
+ * Discriminated by `transport`:
+ *  - 'stdio' → spawn a child process and talk JSON-RPC over stdin/stdout
+ *  - 'http'  → open a Streamable HTTP connection to a remote server
+ */
+export type MCPServerConfig =
+  | {
+      id: string;
+      name: string;
+      enabled: boolean;
+      source: 'bundled' | 'user';
+      transport: 'stdio';
+      command: string;
+      args?: string[];
+      env?: Record<string, string>;
+    }
+  | {
+      id: string;
+      name: string;
+      enabled: boolean;
+      source: 'bundled' | 'user';
+      transport: 'http';
+      url: string;
+      headers?: Record<string, string>;
+    };
+
+/** Lifecycle state for a single MCP client in the registry. */
+export type MCPServerConnectionState =
+  | 'idle'
+  | 'connecting'
+  | 'connected'
+  | 'error'
+  | 'disconnected';
+
+/**
+ * A tool exposed by an MCP server, minimally shaped for the Loom UI and
+ * the tool-call loop. Mirrors the subset of the MCP `Tool` type that we
+ * actually need — keeps our IPC surface small and decouples us from
+ * internal SDK schema changes.
+ */
+export interface MCPToolSummary {
+  name: string;
+  description?: string;
+  /** JSON Schema object — forwarded verbatim to provider adapters. */
+  inputSchema: Record<string, unknown>;
+}
+
+/** Aggregate view of a server for the renderer. */
+export interface MCPServerState {
+  config: MCPServerConfig;
+  connection: MCPServerConnectionState;
+  lastError?: string;
+  tools: MCPToolSummary[];
+}
+
+/** Single content block returned by callTool. Matches MCP spec. */
+export type MCPToolContent =
+  | { type: 'text'; text: string }
+  | { type: 'image'; data: string; mimeType: string }
+  | { type: 'audio'; data: string; mimeType: string }
+  | {
+      type: 'resource';
+      resource: { uri: string; text?: string; mimeType?: string };
+    };
+
+export interface MCPCallToolResult {
+  content: MCPToolContent[];
+  isError?: boolean;
+  /** Provider-agnostic rendering hint for tool-result cards in the chat. */
+  durationMs?: number;
+}
+
 export interface ToolCall {
   id: string;
   serverId: string;
