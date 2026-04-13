@@ -29,7 +29,10 @@ export function ChatView({
   const upsertMessage = useConversations((s) => s.upsertMessage);
   const scrollRef = useRef<HTMLDivElement>(null);
   const [unloading, setUnloading] = useState(false);
-  const [switchToast, setSwitchToast] = useState<string | null>(null);
+  const [switchToast, setSwitchToast] = useState<{
+    target: string;
+    unloadedPrevious: string | null;
+  } | null>(null);
 
   // Composer is enabled if the current conversation's provider is reachable.
   const providerReady = conversation
@@ -57,7 +60,24 @@ export function ChatView({
   const handleModelSwitch = async (newModelId: string): Promise<void> => {
     if (!conversation || newModelId === conversation.modelId) return;
     await updateConversation(conversation.id, { modelId: newModelId });
-    setSwitchToast(newModelId);
+    setSwitchToast({ target: newModelId, unloadedPrevious: null });
+  };
+
+  /**
+   * Switch to a new model AND unload the previous one from Ollama memory
+   * in parallel. Used when the user wants to reclaim RAM as part of the
+   * switch (common on 16 GB Macs with big models).
+   */
+  const handleModelSwitchAndUnload = async (
+    newModelId: string
+  ): Promise<void> => {
+    if (!conversation || newModelId === conversation.modelId) return;
+    const previous = conversation.modelId;
+    await Promise.all([
+      updateConversation(conversation.id, { modelId: newModelId }),
+      unloadModel(previous)
+    ]);
+    setSwitchToast({ target: newModelId, unloadedPrevious: previous });
   };
 
   const handleSend = async (content: string): Promise<void> => {
@@ -126,6 +146,7 @@ export function ChatView({
           }
         }}
         onSwitchModel={handleModelSwitch}
+        onSwitchModelAndUnload={handleModelSwitchAndUnload}
         onOpenLibrary={onOpenLibrary}
       />
 
@@ -149,9 +170,22 @@ export function ChatView({
 
       {switchToast && (
         <div className="border-t border-primary/20 bg-primary/5 px-6 py-2 text-xs text-primary">
-          Switched to <code className="font-semibold">{switchToast}</code>.
-          Next response may take a moment while the new model processes the
-          conversation history.
+          Switched to <code className="font-semibold">{switchToast.target}</code>.{' '}
+          {switchToast.unloadedPrevious ? (
+            <>
+              Unloaded{' '}
+              <code className="font-semibold">
+                {switchToast.unloadedPrevious}
+              </code>{' '}
+              from RAM. Next response will cold-load{' '}
+              <code className="font-semibold">{switchToast.target}</code>.
+            </>
+          ) : (
+            <>
+              Next response may take a moment while the new model processes
+              the conversation history.
+            </>
+          )}
         </div>
       )}
 
@@ -179,6 +213,7 @@ interface ChatHeaderProps {
   streaming: boolean;
   onUnload: () => void;
   onSwitchModel: (modelId: string) => void;
+  onSwitchModelAndUnload: (modelId: string) => void;
   onOpenLibrary: () => void;
 }
 
@@ -192,6 +227,7 @@ function ChatHeader({
   streaming,
   onUnload,
   onSwitchModel,
+  onSwitchModelAndUnload,
   onOpenLibrary
 }: ChatHeaderProps) {
   return (
@@ -218,6 +254,7 @@ function ChatHeader({
           currentModel={modelId}
           provider={provider}
           onSelect={onSwitchModel}
+          onSelectAndUnload={onSwitchModelAndUnload}
           onOpenLibrary={onOpenLibrary}
         />
         {isOllama && loadedInRam && (
