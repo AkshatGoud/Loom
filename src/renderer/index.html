@@ -1,0 +1,18 @@
+<!doctype html>
+<html lang="en" class="dark">
+  <head>
+    <meta charset="UTF-8" />
+    <!--
+      CSP is intentionally omitted in dev because Vite injects inline scripts,
+      uses eval() for HMR, and serves modules from http://localhost:5173.
+      A strict production CSP is set via webRequest.onHeadersReceived in
+      src/main/index.ts when the app loads from file://.
+    -->
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Loom</title>
+  </head>
+  <body class="bg-background text-foreground antialiased">
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
