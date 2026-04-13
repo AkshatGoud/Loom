@@ -2,14 +2,18 @@
 -- Ran once on DB creation; future changes go in db/migrations/ as incremental files.
 
 CREATE TABLE IF NOT EXISTS conversations (
-  id            TEXT PRIMARY KEY,
-  title         TEXT NOT NULL,
-  system_prompt TEXT,
-  provider      TEXT NOT NULL,
-  model_id      TEXT NOT NULL,
-  pinned        INTEGER DEFAULT 0,
-  created_at    INTEGER NOT NULL,
-  updated_at    INTEGER NOT NULL
+  id                  TEXT PRIMARY KEY,
+  title               TEXT NOT NULL,
+  system_prompt       TEXT,
+  provider            TEXT NOT NULL,
+  model_id            TEXT NOT NULL,
+  pinned              INTEGER DEFAULT 0,
+  created_at          INTEGER NOT NULL,
+  updated_at          INTEGER NOT NULL,
+  -- Phase 7: once the user manually renames a chat, auto-rename is
+  -- locked out forever. Set to 1 on any update that comes through
+  -- conversationsDb.update with a non-null title from the renderer.
+  title_manually_set  INTEGER DEFAULT 0
 );
 
 CREATE INDEX IF NOT EXISTS idx_conversations_updated

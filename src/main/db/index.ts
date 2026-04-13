@@ -23,6 +23,7 @@ interface ConversationRow {
   pinned: number;
   created_at: number;
   updated_at: number;
+  title_manually_set: number;
 }
 
 interface MessageRow {
@@ -62,15 +63,27 @@ export function initDb(): Database.Database {
  * against databases created on an earlier Loom build.
  */
 function runMigrations(database: Database.Database): void {
-  const cols = database
+  // messages table (Phase 6)
+  const msgCols = database
     .prepare("PRAGMA table_info(messages)")
     .all() as { name: string }[];
-  const names = new Set(cols.map((c) => c.name));
-  if (!names.has('tool_calls_json')) {
+  const msgNames = new Set(msgCols.map((c) => c.name));
+  if (!msgNames.has('tool_calls_json')) {
     database.exec('ALTER TABLE messages ADD COLUMN tool_calls_json TEXT');
   }
-  if (!names.has('tool_call_id')) {
+  if (!msgNames.has('tool_call_id')) {
     database.exec('ALTER TABLE messages ADD COLUMN tool_call_id TEXT');
+  }
+
+  // conversations table (Phase 7 — auto-rename gate)
+  const convoCols = database
+    .prepare("PRAGMA table_info(conversations)")
+    .all() as { name: string }[];
+  const convoNames = new Set(convoCols.map((c) => c.name));
+  if (!convoNames.has('title_manually_set')) {
+    database.exec(
+      'ALTER TABLE conversations ADD COLUMN title_manually_set INTEGER DEFAULT 0'
+    );
   }
 }
 
@@ -163,6 +176,11 @@ export const conversationsDb = {
     return this.get(id)!;
   },
 
+  /**
+   * User-facing update. Setting `title` here flips `title_manually_set`
+   * to 1, which permanently locks out auto-rename for this conversation.
+   * Called from the renderer via `conversations:update` IPC.
+   */
   update(
     id: string,
     patch: Partial<Pick<Conversation, 'title' | 'systemPrompt' | 'pinned' | 'provider' | 'modelId'>>
@@ -170,21 +188,70 @@ export const conversationsDb = {
     const current = this.get(id);
     if (!current) throw new Error(`Conversation ${id} not found`);
     const next = { ...current, ...patch, updatedAt: Date.now() };
+    const manuallySet = patch.title !== undefined ? 1 : undefined;
+    if (manuallySet === 1) {
+      requireDb()
+        .prepare(
+          `UPDATE conversations
+           SET title = ?, system_prompt = ?, provider = ?, model_id = ?, pinned = ?, updated_at = ?, title_manually_set = 1
+           WHERE id = ?`
+        )
+        .run(
+          next.title,
+          next.systemPrompt,
+          next.provider,
+          next.modelId,
+          next.pinned ? 1 : 0,
+          next.updatedAt,
+          id
+        );
+    } else {
+      requireDb()
+        .prepare(
+          `UPDATE conversations
+           SET title = ?, system_prompt = ?, provider = ?, model_id = ?, pinned = ?, updated_at = ?
+           WHERE id = ?`
+        )
+        .run(
+          next.title,
+          next.systemPrompt,
+          next.provider,
+          next.modelId,
+          next.pinned ? 1 : 0,
+          next.updatedAt,
+          id
+        );
+    }
+  },
+
+  /**
+   * Internal-only title update used by the Phase 7 auto-rename path.
+   * Does NOT set `title_manually_set`, and is a no-op if the flag has
+   * already been flipped — so user edits always win.
+   */
+  setAutoTitle(id: string, title: string): boolean {
+    const row = requireDb()
+      .prepare<[string], { title_manually_set: number }>(
+        'SELECT title_manually_set FROM conversations WHERE id = ?'
+      )
+      .get(id);
+    if (!row || row.title_manually_set === 1) return false;
     requireDb()
       .prepare(
-        `UPDATE conversations
-         SET title = ?, system_prompt = ?, provider = ?, model_id = ?, pinned = ?, updated_at = ?
-         WHERE id = ?`
+        `UPDATE conversations SET title = ?, updated_at = ? WHERE id = ? AND title_manually_set = 0`
       )
-      .run(
-        next.title,
-        next.systemPrompt,
-        next.provider,
-        next.modelId,
-        next.pinned ? 1 : 0,
-        next.updatedAt,
-        id
-      );
+      .run(title, Date.now(), id);
+    return true;
+  },
+
+  /** True iff auto-rename is still allowed for this conversation. */
+  canAutoRename(id: string): boolean {
+    const row = requireDb()
+      .prepare<[string], { title_manually_set: number; title: string }>(
+        'SELECT title_manually_set, title FROM conversations WHERE id = ?'
+      )
+      .get(id);
+    return row != null && row.title_manually_set === 0;
   },
 
   touch(id: string): void {

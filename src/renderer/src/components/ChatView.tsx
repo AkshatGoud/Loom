@@ -3,6 +3,7 @@ import { Loader2, PowerOff } from 'lucide-react';
 import { Composer } from './Composer';
 import { Message } from './Message';
 import { ModelPicker } from './ModelPicker';
+import { StatusPill } from './StatusPill';
 import {
   useActiveConversation,
   useActiveMessages,
@@ -27,6 +28,12 @@ export function ChatView({
   const unloadModel = useOllama((s) => s.unloadModel);
   const updateConversation = useConversations((s) => s.updateConversation);
   const upsertMessage = useConversations((s) => s.upsertMessage);
+  // Status pill is driven by the messageStatus slice of the store.
+  // We look up the entry for the currently-streaming message — the
+  // most-recent assistant turn the main process is telling us about.
+  const activeStatus = useConversations((s) =>
+    streamingMessageId ? (s.messageStatus[streamingMessageId] ?? null) : null
+  );
   const scrollRef = useRef<HTMLDivElement>(null);
   const [unloading, setUnloading] = useState(false);
   const [switchToast, setSwitchToast] = useState<{
@@ -167,6 +174,12 @@ export function ChatView({
           ))
         )}
       </div>
+
+      {activeStatus && (
+        <div className="flex">
+          <StatusPill status={activeStatus} />
+        </div>
+      )}
 
       {switchToast && (
         <div className="border-t border-primary/20 bg-primary/5 px-6 py-2 text-xs text-primary">

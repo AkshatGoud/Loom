@@ -1,5 +1,6 @@
 import { create } from 'zustand';
 import type {
+  ChatStatusInfo,
   Conversation,
   ConversationCreateInput,
   Message,
@@ -10,24 +11,34 @@ interface ConversationsState {
   conversations: Conversation[];
   activeId: string | null;
   messagesByConv: Record<string, Message[]>;
+  /**
+   * In-flight turn status, keyed by the assistant message id the
+   * status belongs to. Populated by the streaming hook when the main
+   * process emits `status` events, cleared when the turn completes.
+   */
+  messageStatus: Record<string, ChatStatusInfo>;
   loading: boolean;
 
   refresh: () => Promise<void>;
   selectConversation: (id: string) => Promise<void>;
   createConversation: (input: ConversationCreateInput) => Promise<Conversation>;
   updateConversation: (id: string, patch: Partial<Conversation>) => Promise<void>;
+  /** Merge an updated Conversation (e.g. from an auto-rename broadcast) without round-tripping IPC. */
+  mergeConversation: (conversation: Conversation) => void;
   removeConversation: (id: string) => Promise<void>;
 
   // Streaming helpers called by useStreamingChat
   upsertMessage: (message: Message) => void;
   appendDelta: (conversationId: string, messageId: string, delta: string) => void;
   setMessages: (conversationId: string, messages: Message[]) => void;
+  setMessageStatus: (messageId: string, status: ChatStatusInfo | null) => void;
 }
 
 export const useConversations = create<ConversationsState>((set, get) => ({
   conversations: [],
   activeId: null,
   messagesByConv: {},
+  messageStatus: {},
   loading: false,
 
   async refresh() {
@@ -64,6 +75,19 @@ export const useConversations = create<ConversationsState>((set, get) => ({
     set((state) => ({
       conversations: state.conversations.map((c) => (c.id === id ? updated : c))
     }));
+  },
+
+  mergeConversation(conversation) {
+    set((state) => {
+      const exists = state.conversations.some((c) => c.id === conversation.id);
+      return {
+        conversations: exists
+          ? state.conversations.map((c) =>
+              c.id === conversation.id ? conversation : c
+            )
+          : [conversation, ...state.conversations]
+      };
+    });
   },
 
   async removeConversation(id) {
@@ -113,6 +137,19 @@ export const useConversations = create<ConversationsState>((set, get) => ({
     set((state) => ({
       messagesByConv: { ...state.messagesByConv, [conversationId]: messages }
     }));
+  },
+
+  setMessageStatus(messageId, status) {
+    set((state) => {
+      if (status === null) {
+        if (!(messageId in state.messageStatus)) return {};
+        const { [messageId]: _removed, ...rest } = state.messageStatus;
+        return { messageStatus: rest };
+      }
+      return {
+        messageStatus: { ...state.messageStatus, [messageId]: status }
+      };
+    });
   }
 }));
 

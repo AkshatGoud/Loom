@@ -205,8 +205,34 @@ export interface ChatSendResult {
   assistantMessageId: string;
 }
 
+/**
+ * What the model / tool loop is doing right now, surfaced to the
+ * renderer so the UI can show a status pill with a live elapsed-time
+ * counter between user actions.
+ */
+export type ChatStatusPhase =
+  | 'waiting' // send fired, haven't called provider yet
+  | 'loading_model' // Ollama cold-loading weights (5–15s)
+  | 'thinking' // provider invoked, no delta yet
+  | 'running_tool'; // a tool call is mid-execution
+
+export interface ChatStatusInfo {
+  phase: ChatStatusPhase;
+  /** Human-readable hint — e.g. "gemma4:e4b" for loading, "filesystem: list_directory" for tool runs. */
+  detail?: string;
+  /** ms since epoch, used by the renderer to compute elapsed time live. */
+  startedAt: number;
+}
+
 export interface ChatStreamEvent {
-  type: 'delta' | 'tool_call' | 'tool_result' | 'done' | 'error';
+  type:
+    | 'delta'
+    | 'tool_call'
+    | 'tool_result'
+    | 'done'
+    | 'error'
+    | 'status'
+    | 'conversation_updated';
   conversationId: string;
   messageId?: string;
   delta?: string;
@@ -215,6 +241,10 @@ export interface ChatStreamEvent {
   toolResult?: string;
   usage?: { promptTokens: number; completionTokens: number };
   error?: string;
+  /** Populated when type === 'status'; `null` phase means "clear status". */
+  status?: ChatStatusInfo | null;
+  /** Populated when type === 'conversation_updated' (e.g. auto-rename changed title). */
+  conversation?: Conversation;
 }
 
 export interface ConversationCreateInput {

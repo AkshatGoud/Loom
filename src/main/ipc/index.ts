@@ -22,8 +22,14 @@ import {
   routeToolCall,
   MAX_TOOL_ITERATIONS
 } from '../mcp/tool-loop';
+import {
+  applyImmediateAutoRename,
+  refineTitleWithLLM
+} from '../chat/auto-rename';
 import type {
   ChatSendInput,
+  ChatStatusInfo,
+  ChatStatusPhase,
   ChatStreamEvent,
   Conversation,
   Message,
@@ -149,23 +155,69 @@ export function registerIpcHandlers(): void {
     messagesDb.listForConversation(id)
   );
 
-  // ----- Chat (Phase 6: multi-turn tool-call loop) -----
+  // ----- Chat (Phase 6 tool-call loop + Phase 7 auto-rename + status events) -----
   ipcMain.handle('chat:send', async (_e, input: ChatSendInput) => {
-    const conversation = conversationsDb.get(input.conversationId);
-    if (!conversation) throw new Error('Conversation not found');
+    const initialConversation = conversationsDb.get(input.conversationId);
+    if (!initialConversation) throw new Error('Conversation not found');
 
     // 1. Persist the user message up front so it survives any error below.
     const userMsg = messagesDb.insert({
-      conversationId: conversation.id,
+      conversationId: initialConversation.id,
       role: 'user',
       content: input.content
     });
     send({
       type: 'delta',
-      conversationId: conversation.id,
+      conversationId: initialConversation.id,
       messageId: userMsg.id,
       delta: ''
     });
+
+    // 1a. Phase 7: Auto-rename. If this is the first user message in a
+    //     freshly-created chat (title === "New conversation" and the
+    //     user hasn't manually renamed it), derive a deterministic title
+    //     from the message content and push a conversation_updated event
+    //     to the renderer so the sidebar reflects it instantly.
+    const immediateTitle = applyImmediateAutoRename(
+      initialConversation.id,
+      input.content
+    );
+    if (immediateTitle) {
+      const updated = conversationsDb.get(initialConversation.id);
+      if (updated) {
+        send({
+          type: 'conversation_updated',
+          conversationId: initialConversation.id,
+          conversation: updated
+        });
+      }
+    }
+
+    // Re-fetch in case auto-rename changed the row (keeps conversation.title
+    // consistent with what the renderer just saw).
+    const conversation =
+      conversationsDb.get(initialConversation.id) ?? initialConversation;
+
+    // Helper to emit a status update for the current in-flight assistant
+    // message. `null` phase means "clear status" — used when streaming
+    // begins or the turn ends.
+    let currentAssistantId: string | null = null;
+    const sendStatus = (
+      phase: ChatStatusPhase | null,
+      detail?: string
+    ): void => {
+      if (!currentAssistantId) return;
+      const status: ChatStatusInfo | null =
+        phase == null
+          ? null
+          : { phase, detail, startedAt: Date.now() };
+      send({
+        type: 'status',
+        conversationId: conversation.id,
+        messageId: currentAssistantId,
+        status
+      });
+    };
 
     // 2. Build the provider's initial message history from everything
     //    already persisted in SQLite. This is what lets a new model see
@@ -180,7 +232,7 @@ export function registerIpcHandlers(): void {
 
     // 3. Resolve the active MCP tool catalog. Phase 6 exposes EVERY
     //    registered MCP server to EVERY chat — per-conversation
-    //    attachment comes in Phase 7.
+    //    attachment comes in Phase 7 (sub-section c).
     const provider = getProvider(conversation.provider);
     const activeTools = provider.supportsTools
       ? await collectActiveTools()
@@ -189,7 +241,29 @@ export function registerIpcHandlers(): void {
     const controller = new AbortController();
     inflight.set(conversation.id, controller);
 
+    // Decide whether the first turn will be a cold model load so we
+    // can show "Loading ..." instead of "Thinking ..." in the pill.
+    // Only applies to Ollama — cloud providers don't have local
+    // model memory to cold-load.
+    let firstTurnInitialPhase: ChatStatusPhase = 'thinking';
+    let firstTurnInitialDetail: string | undefined;
+    if (conversation.provider === 'ollama') {
+      try {
+        const status = await getOllamaStatus();
+        const isLoaded = status.loadedModels.some(
+          (m) => m.name === conversation.modelId
+        );
+        if (!isLoaded) {
+          firstTurnInitialPhase = 'loading_model';
+          firstTurnInitialDetail = conversation.modelId;
+        }
+      } catch {
+        /* ignore — fall back to 'thinking' */
+      }
+    }
+
     let finalAssistantId: string | null = null;
+    let firstTurnSucceededForRefinement = false;
 
     try {
       // 4. Multi-turn loop. Each iteration:
@@ -205,6 +279,7 @@ export function registerIpcHandlers(): void {
           content: ''
         });
         finalAssistantId = assistantMsg.id;
+        currentAssistantId = assistantMsg.id;
         send({
           type: 'delta',
           conversationId: conversation.id,
@@ -212,10 +287,21 @@ export function registerIpcHandlers(): void {
           delta: ''
         });
 
+        // Emit initial status for this turn. First iteration uses the
+        // pre-computed cold-load / thinking phase; subsequent
+        // iterations are always just "thinking" (the model already
+        // has the previous weights warm).
+        if (iter === 0) {
+          sendStatus(firstTurnInitialPhase, firstTurnInitialDetail);
+        } else {
+          sendStatus('thinking');
+        }
+
         let accumulated = '';
         const pendingCalls: ToolCall[] = [];
         let iterDone = false;
         let iterErrored = false;
+        let sawFirstDelta = false;
         let usage: { promptTokens: number; completionTokens: number } | undefined;
 
         for await (const event of provider.stream({
@@ -226,6 +312,12 @@ export function registerIpcHandlers(): void {
           signal: controller.signal
         })) {
           if (event.type === 'delta' && event.delta) {
+            if (!sawFirstDelta) {
+              // Streaming has started — clear any status pill so the
+              // user sees the token stream itself as the progress.
+              sawFirstDelta = true;
+              sendStatus(null);
+            }
             accumulated += event.delta;
             send({
               type: 'delta',
@@ -256,6 +348,7 @@ export function registerIpcHandlers(): void {
             break;
           } else if (event.type === 'error') {
             iterErrored = true;
+            sendStatus(null);
             send({
               type: 'error',
               conversationId: conversation.id,
@@ -296,13 +389,17 @@ export function registerIpcHandlers(): void {
 
         if (!iterDone || pendingCalls.length === 0) {
           // Stream ended cleanly with no tool calls → conversation
-          // complete. Notify the renderer and stop looping.
+          // complete. Clear any lingering status, notify the
+          // renderer, stop looping, and note success so the async
+          // title-refinement path can fire below.
+          sendStatus(null);
           send({
             type: 'done',
             conversationId: conversation.id,
             messageId: assistantMsg.id,
             usage
           });
+          if (iter === 0) firstTurnSucceededForRefinement = true;
           return;
         }
 
@@ -310,6 +407,14 @@ export function registerIpcHandlers(): void {
         //    as its own `role: 'tool'` message.
         for (const call of pendingCalls) {
           if (controller.signal.aborted) return;
+
+          // Pretty "server: tool" label for the status pill.
+          const route = activeTools.routes.get(call.name);
+          const statusLabel = route
+            ? `${route.serverId}: ${route.toolName}`
+            : call.name;
+          sendStatus('running_tool', statusLabel);
+
           const { resultText, isError, durationMs } = await routeToolCall(
             activeTools.routes,
             { id: call.id, name: call.name, arguments: call.arguments }
@@ -347,6 +452,7 @@ export function registerIpcHandlers(): void {
       }
 
       // Hit the iteration cap without the model converging.
+      sendStatus(null);
       send({
         type: 'error',
         conversationId: conversation.id,
@@ -354,6 +460,7 @@ export function registerIpcHandlers(): void {
         error: `Tool-call loop exceeded ${MAX_TOOL_ITERATIONS} iterations without a plain-text response.`
       });
     } catch (err) {
+      sendStatus(null);
       send({
         type: 'error',
         conversationId: conversation.id,
@@ -362,6 +469,27 @@ export function registerIpcHandlers(): void {
       });
     } finally {
       inflight.delete(conversation.id);
+    }
+
+    // Fire the Phase 7 async LLM title refinement in the background
+    // once the first assistant turn has completed cleanly. Only for
+    // conversations that are still eligible for auto-rename — the
+    // helper enforces this internally, but we also early-out here so
+    // we don't spam the log for ineligible conversations.
+    if (firstTurnSucceededForRefinement && immediateTitle != null) {
+      void (async () => {
+        const refined = await refineTitleWithLLM(conversation, input.content);
+        if (refined) {
+          const updated = conversationsDb.get(conversation.id);
+          if (updated) {
+            send({
+              type: 'conversation_updated',
+              conversationId: conversation.id,
+              conversation: updated
+            });
+          }
+        }
+      })();
     }
 
     return {
