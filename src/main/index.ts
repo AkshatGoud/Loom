@@ -65,7 +65,12 @@ function createMainWindow(): void {
   const devServerUrl = process.env.ELECTRON_RENDERER_URL;
   if (devServerUrl) {
     void mainWindow.loadURL(devServerUrl);
-    mainWindow.webContents.openDevTools({ mode: 'right' });
+    // DevTools is opt-in now. Set LOOM_DEVTOOLS=1 to auto-open it when
+    // actively debugging; otherwise press Cmd+Option+I (macOS) or
+    // Ctrl+Shift+I (Windows/Linux) any time to open it on demand.
+    if (process.env.LOOM_DEVTOOLS === '1') {
+      mainWindow.webContents.openDevTools({ mode: 'right' });
+    }
   } else {
     void mainWindow.loadFile(join(__dirname, '../renderer/index.html'));
   }
